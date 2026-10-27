@@ -1,0 +1,139 @@
+name: terraform
+
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write # only used when AWS_PLAN_ROLE_ARN is configured
+
+concurrency:
+  group: terraform-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: "1.9.8"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff infra
+
+  plan:
+    needs: fmt
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, prod]
+    defaults:
+      run:
+        working-directory: infra/envs/${{ matrix.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # With a read-only plan role configured (repo variable AWS_PLAN_ROLE_ARN),
+      # plan runs against the real S3 backend. Otherwise it runs plan-only.
+      - name: Configure AWS credentials
+        if: vars.AWS_PLAN_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Use plan-only backend (no AWS credentials)
+        if: vars.AWS_PLAN_ROLE_ARN == ''
+        run: cp ../../plan-only/plan_only_override.tf .
+
+      - name: terraform init
+        run: terraform init -input=false
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      - name: terraform plan
+        run: |
+          terraform plan -refresh=false -input=false -no-color -out=tfplan
+          terraform show -no-color tfplan > plan.txt
+
+      - name: Publish plan to job summary
+        run: |
+          {
+            echo "### Terraform plan: \`${{ matrix.environment }}\`"
+            echo
+            echo "**$(grep -E '^(Plan:|No changes)' plan.txt || echo 'see artifact')**"
+            echo
+            echo '<details><summary>Full plan</summary>'
+            echo
+            echo '```hcl'
+            cat plan.txt
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: |
+            infra/envs/${{ matrix.environment }}/plan.txt
+            infra/envs/${{ matrix.environment }}/tfplan
+          retention-days: 14
+
+      # Updates a single sticky comment per environment. Fork PRs get a
+      # read-only token, so this step is allowed to fail there.
+      - name: Comment plan on PR
+        uses: actions/github-script@v7
+        continue-on-error: true
+        env:
+          PLAN_ENV: ${{ matrix.environment }}
+          PLAN_FILE: infra/envs/${{ matrix.environment }}/plan.txt
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env.PLAN_ENV;
+            const marker = `<!-- terraform-plan-${env} -->`;
+            let plan = fs.readFileSync(process.env.PLAN_FILE, 'utf8');
+            const summary = (plan.match(/^(Plan:.*|No changes.*)$/m) || ['see workflow artifact'])[0];
+            const limit = 60000;
+            if (plan.length > limit) {
+              plan = plan.slice(0, limit) + '\n... truncated, full plan in the workflow artifact ...';
+            }
+            const body = [
+              marker,
+              `### Terraform plan: \`${env}\``,
+              `**${summary}**`,
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```hcl',
+              plan,
+              '```',
+              '</details>',
+              '',
+              `_Run [#${context.runNumber}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})_`,
+            ].join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

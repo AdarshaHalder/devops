@@ -1,0 +1,62 @@
+name: database
+
+# End-to-end check of the local database tasks exactly as a reviewer runs
+# them: compose up -> migrate + seed -> backup -> restore -> verify.
+on:
+  pull_request:
+    paths:
+      - "db/**"
+      - "scripts/**"
+      - "docker-compose.yml"
+      - ".github/workflows/database.yml"
+  push:
+    branches: [main]
+    paths:
+      - "db/**"
+      - "scripts/**"
+      - "docker-compose.yml"
+      - ".github/workflows/database.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  backup-restore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start database
+        run: docker compose up -d --wait db
+
+      - name: Migrate and seed
+        run: docker compose run --rm migrate
+
+      - name: Migrations are idempotent
+        run: docker compose run --rm migrate
+
+      - name: Query plan for the reporting query
+        run: ./scripts/explain.sh
+
+      - name: Backup
+        run: ./scripts/backup.sh
+
+      - name: Restore into a fresh database
+        run: ./scripts/restore.sh
+
+      - name: Restore detects tampering
+        run: |
+          dump=$(ls -1t backups/*.dump | head -n 1)
+          printf 'x' >> "$dump"
+          if ./scripts/restore.sh "$dump"; then
+            echo "restore accepted a corrupted dump" >&2
+            exit 1
+          fi
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

@@ -1,0 +1,16 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+plan.txt
+crash.log
+# The plan-only override must only ever be copied in temporarily.
+infra/envs/**/*_override.tf
+
+# Local database
+.env
+backups/
+
+.DS_Store
